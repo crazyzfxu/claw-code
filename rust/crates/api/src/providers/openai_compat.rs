@@ -172,9 +172,14 @@ impl OpenAiCompatClient {
         request: &MessageRequest,
     ) -> Result<MessageStream, ApiError> {
         preflight_message_request(request)?;
-        let response = self
-            .send_with_retry(&request.clone().with_streaming())
-            .await?;
+        // Only force streaming if the request already has stream: true
+        // For OpenAI compat providers that don't properly support SSE, allow stream: false
+        let streamed_request = if request.stream {
+            request.clone().with_streaming()
+        } else {
+            request.clone()
+        };
+        let response = self.send_with_retry(&streamed_request).await?;
         Ok(MessageStream {
             request_id: request_id_from_headers(response.headers()),
             response,
@@ -224,6 +229,7 @@ impl OpenAiCompatClient {
         self.http
             .post(&request_url)
             .header("content-type", "application/json")
+            .header("user-agent", "claw/1.0")
             .bearer_auth(&self.api_key)
             .json(&build_chat_completion_request(request, self.config()))
             .send()

@@ -6480,7 +6480,7 @@ impl ApiClient for AnthropicRuntimeClient {
                 .enable_tools
                 .then(|| filter_tool_specs(&self.tool_registry, self.allowed_tools.as_ref())),
             tool_choice: self.enable_tools.then_some(ToolChoice::Auto),
-            stream: true,
+            stream: false,  // forced false for OpenAI-compat providers that don't support SSE properly
             ..Default::default()
         };
 
