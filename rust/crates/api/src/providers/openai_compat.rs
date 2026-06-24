@@ -431,7 +431,17 @@ impl StreamState {
         }
 
         for choice in chunk.choices {
-            if let Some(content) = choice.delta.content.filter(|value| !value.is_empty()) {
+            let stream_text = choice
+                .delta
+                .content
+                .as_ref()
+                .filter(|value| !value.is_empty())
+                .or(choice
+                    .delta
+                    .reasoning_content
+                    .as_ref()
+                    .filter(|value| !value.is_empty()));
+            if let Some(content) = stream_text {
                 if !self.text_started {
                     self.text_started = true;
                     events.push(StreamEvent::ContentBlockStart(ContentBlockStartEvent {
@@ -443,7 +453,9 @@ impl StreamState {
                 }
                 events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
                     index: 0,
-                    delta: ContentBlockDelta::TextDelta { text: content },
+                    delta: ContentBlockDelta::TextDelta {
+                        text: content.clone(),
+                    },
                 }));
             }
 
@@ -628,6 +640,8 @@ struct ChatMessage {
     #[serde(default)]
     content: Option<String>,
     #[serde(default)]
+    reasoning_content: Option<String>,
+    #[serde(default)]
     tool_calls: Vec<ResponseToolCall>,
 }
 
@@ -673,6 +687,8 @@ struct ChunkChoice {
 struct ChunkDelta {
     #[serde(default)]
     content: Option<String>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
     #[serde(default)]
     tool_calls: Vec<DeltaToolCall>,
 }
@@ -952,8 +968,14 @@ fn normalize_response(
             "chat completion response missing choices",
         ))?;
     let mut content = Vec::new();
-    if let Some(text) = choice.message.content.filter(|value| !value.is_empty()) {
-        content.push(OutputContentBlock::Text { text });
+    let effective_content = choice
+        .message
+        .content
+        .as_ref()
+        .filter(|value| !value.is_empty())
+        .or(choice.message.reasoning_content.as_ref());
+    if let Some(text) = effective_content {
+        content.push(OutputContentBlock::Text { text: text.clone() });
     }
     for tool_call in choice.message.tool_calls {
         content.push(OutputContentBlock::ToolUse {
@@ -1136,8 +1158,9 @@ impl StringExt for String {
 mod tests {
     use super::{
         build_chat_completion_request, chat_completions_endpoint, is_reasoning_model,
-        normalize_finish_reason, openai_tool_choice, parse_tool_arguments, OpenAiCompatClient,
-        OpenAiCompatConfig,
+        normalize_finish_reason, normalize_response, openai_tool_choice, parse_tool_arguments,
+        ChatCompletionChunk, ChatCompletionResponse, OpenAiCompatClient, OpenAiCompatConfig,
+        StreamState,
     };
     use crate::error::ApiError;
     use crate::types::{
@@ -1500,5 +1523,135 @@ mod tests {
             payload.get("max_completion_tokens").is_none(),
             "gpt-4o must not emit max_completion_tokens"
         );
+    }
+
+    #[test]
+    fn chat_message_parses_reasoning_content() {
+        let json = r#"{
+            "id": "test",
+            "model": "deepseek-v4-flash",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning_content": "The user wants OK"
+                },
+                "finish_reason": "stop"
+            }]
+        }"#;
+        let resp: ChatCompletionResponse = serde_json::from_str(json).unwrap();
+        let msg = &resp.choices[0].message;
+        assert_eq!(msg.content.as_deref(), Some(""));
+        assert_eq!(msg.reasoning_content.as_deref(), Some("The user wants OK"));
+        // Verify the fallback logic used in normalize_response: prefer non-empty
+        // content, otherwise fall back to reasoning_content.
+        let effective: &String = msg
+            .content
+            .as_ref()
+            .filter(|s: &&String| !s.is_empty())
+            .or(msg.reasoning_content.as_ref())
+            .unwrap();
+        assert_eq!(effective, "The user wants OK");
+    }
+
+    #[test]
+    fn chunk_delta_parses_reasoning_content() {
+        let json = r#"{
+            "id": "x",
+            "model": "deepseek-v4-flash",
+            "choices": [{
+                "delta": {
+                    "content": null,
+                    "reasoning_content": "Thinking..."
+                }
+            }]
+        }"#;
+        let chunk: ChatCompletionChunk = serde_json::from_str(json).unwrap();
+        let delta = &chunk.choices[0].delta;
+        assert_eq!(delta.reasoning_content.as_deref(), Some("Thinking..."));
+        assert_eq!(delta.content, None);
+    }
+
+    #[test]
+    fn stream_state_falls_back_to_reasoning_content() {
+        // Simulate the chunk sequence a reasoning model produces: the
+        // first chunk announces the role with empty reasoning_content,
+        // then subsequent chunks carry reasoning_content in the delta.
+        let mut state = StreamState::new("deepseek-v4-flash".to_string());
+
+        let initial = r#"{
+            "id": "stream-1",
+            "model": "deepseek-v4-flash",
+            "choices": [{
+                "delta": {
+                    "role": "assistant",
+                    "content": null,
+                    "reasoning_content": ""
+                }
+            }]
+        }"#;
+        let chunk: ChatCompletionChunk = serde_json::from_str(initial).unwrap();
+        state.ingest_chunk(chunk).expect("initial chunk ok");
+
+        let text_chunk = r#"{
+            "id": "stream-1",
+            "model": "deepseek-v4-flash",
+            "choices": [{
+                "delta": {
+                    "content": null,
+                    "reasoning_content": "OK"
+                }
+            }]
+        }"#;
+        let chunk: ChatCompletionChunk = serde_json::from_str(text_chunk).unwrap();
+        let events = state
+            .ingest_chunk(chunk)
+            .expect("text chunk should be accepted via reasoning_content fallback");
+        // Verify we got a ContentBlockDelta with the reasoning content
+        // (this is the actual fix: without it, content is empty and
+        // downstream consumers see no text at all).
+        let delta_text = events.iter().find_map(|event| match event {
+            crate::types::StreamEvent::ContentBlockDelta(
+                crate::types::ContentBlockDeltaEvent {
+                    delta: crate::types::ContentBlockDelta::TextDelta { text },
+                    ..
+                },
+            ) => Some(text.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            delta_text.as_deref(),
+            Some("OK"),
+            "reasoning_content should drive the text delta when content is null"
+        );
+    }
+
+    #[test]
+    fn normalize_response_uses_reasoning_content_fallback() {
+        // Reasoning models (DeepSeek V4 Flash, GLM-5.2) return content="" with
+        // the actual answer in reasoning_content. normalize_response must
+        // fall back to reasoning_content so the response has a text block.
+        let json = r#"{
+            "id": "resp-1",
+            "model": "deepseek-v4-flash",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning_content": "The user wants OK"
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 4}
+        }"#;
+        let resp: ChatCompletionResponse = serde_json::from_str(json).unwrap();
+        let msg = normalize_response("deepseek-v4-flash", resp).expect("normalize ok");
+        assert_eq!(msg.content.len(), 1, "expected one text block");
+        match &msg.content[0] {
+            crate::types::OutputContentBlock::Text { text } => {
+                assert_eq!(text, "The user wants OK");
+            }
+            other => panic!("expected Text block, got {other:?}"),
+        }
     }
 }
